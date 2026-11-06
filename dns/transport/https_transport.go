@@ -2,7 +2,10 @@ package transport
 
 import (
 	"context"
+	stdtls "crypto/tls"
 	"errors"
+	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"sync"
@@ -10,7 +13,6 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-box/common/tls"
-	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
@@ -19,260 +21,323 @@ import (
 )
 
 const (
-	// HTTP/2 空闲健康检查与 Ping 超时配置
+	// 单次拨号（含 TLS 握手）的上限；上层 ctx 更短时以 ctx 为准
+	wrapperDialTimeout = 15 * time.Second
+	// 没有任何在途请求后，空闲连接最多保留的时间
+	wrapperIdleTimeout = 60 * time.Second
+	// h2 健康检查：读空闲超过该时间发 PING，PingTimeout 内无响应则关闭连接
 	h2ReadIdleTimeout = 30 * time.Second
-	h2PingTimeout     = 15 * time.Second
+	h2PingTimeout     = 10 * time.Second
 
-	// HTTP/1.1 连接池配置
-	h1MaxIdleConns        = 10
-	h1MaxIdleConnsPerHost = 10
-	h1IdleConnTimeout     = 90 * time.Second
-
-	// 从 HTTP/1.1 尝试自动恢复到 HTTP/2 的冷却间隔
-	fallbackRecoveryInterval = 5 * time.Minute
+	h1MaxIdleConns        = 8
+	h1MaxIdleConnsPerHost = 4
 )
 
-var errFallback = E.New("fallback to HTTP/1.1")
+var (
+	errFallback = E.New("fallback to HTTP/1.1")
+	errUseHTTP2 = errors.New("switch back to HTTP/2")
+	// errTransportClosed 表示请求落在了已被关闭的 wrapper 上。
+	// DNS 查询幂等，调用方可以换新的 wrapper 安全重试。
+	errTransportClosed = fmt.Errorf("dns over https: transport closed: %w", net.ErrClosed)
+)
 
+type dialMode int
+
+const (
+	dialHTTP2 dialMode = iota // https，期望 ALPN 协商为 h2
+	dialHTTP1                 // https，期望 ALPN 不是 h2
+	dialPlain                 // 明文 http，不检查 ALPN
+)
+
+// HTTPSTransportWrapper 同时持有 HTTP/2 与 HTTP/1.1 transport。
+//
+// 协议选择：
+//   - fallback 是跨 wrapper 共享的"首选协议"提示（true = 先用 HTTP/1.1）。
+//   - 每条新连接拨号完成后检查 ALPN 实际协商结果，与当前 transport 不匹配时
+//     更新 fallback、丢弃该连接，并用另一个 transport 重试一次，两个方向都能自愈。
+//   - scheme 为 http（如 Tailscale 的明文 DoH）固定走 HTTP/1.1，不做 ALPN 检查。
+//
+// 关闭语义：
+//   - CloseIdleConnections：只关闭空闲连接。
+//   - Shutdown(grace)：优雅关闭，等在途请求结束或宽限期到后再强制关闭。
+//   - Close：立即关闭所有连接，包括在途请求占用的连接。
 type HTTPSTransportWrapper struct {
 	dialer         N.Dialer
 	serverAddr     M.Socksaddr
+	fallback       *atomic.Bool
 	http2Transport *http2.Transport
 	httpTransport  *http.Transport
-	fallback       *atomic.Bool
-	permanentH1    bool         // 标记是否为初始强制 H1（如 Tailscale 明文 HTTP DoH）
-	fallbackAtNano atomic.Int64 // 记录触发 ALPN 降级的时间戳
 
-	closeCtx    context.Context
-	closeCancel context.CancelFunc
-
-	connAccess  sync.Mutex
+	access      sync.Mutex
 	connections map[*httpsTrackedConn]struct{}
-	stashedConn net.Conn // 暂存从 H2 降级移交的已握手连接，实现 0-RTT 降级
+	inflight    int
 	closed      bool
+	draining    bool
+	idleTimer   *time.Timer
+	drainTimer  *time.Timer
 }
 
 func NewHTTPSTransportWrapper(dialer N.Dialer, serverAddr M.Socksaddr, fallback *atomic.Bool) *HTTPSTransportWrapper {
-	closeCtx, closeCancel := context.WithCancel(context.Background())
 	wrapper := &HTTPSTransportWrapper{
 		dialer:      dialer,
 		serverAddr:  serverAddr,
 		fallback:    fallback,
-		permanentH1: fallback.Load(), // 如果初始化时已经是 true，说明是明文 HTTP
-		closeCtx:    closeCtx,
-		closeCancel: closeCancel,
 		connections: make(map[*httpsTrackedConn]struct{}),
 	}
-
 	wrapper.http2Transport = &http2.Transport{
 		DialTLSContext: func(ctx context.Context, _, _ string, _ *tls.STDConfig) (net.Conn, error) {
-			resultConn, err := wrapper.dialContext(ctx)
-			if err != nil {
-				return nil, err
-			}
-			// 使用 common.Cast 兼容被中间件包装过的连接
-			if tlsConn, isTLSConn := common.Cast[tls.Conn](resultConn); isTLSConn {
-				state := tlsConn.ConnectionState()
-				if state.NegotiatedProtocol != http2.NextProtoTLS {
-					// 标记降级并记录时间
-					wrapper.fallbackAtNano.Store(time.Now().UnixNano())
-					fallback.Store(true)
-					// 将已握手成功的连接暂存，直接移交给 httpTransport 复用，避免关闭重连
-					wrapper.stashConn(resultConn)
-					return nil, errFallback
-				}
-			}
-			return wrapper.trackConn(resultConn)
+			return wrapper.dial(ctx, dialHTTP2)
 		},
-		ReadIdleTimeout: h2ReadIdleTimeout,
-		PingTimeout:     h2PingTimeout,
+		DisableCompression: true,
+		ReadIdleTimeout:    h2ReadIdleTimeout,
+		PingTimeout:        h2PingTimeout,
 	}
-
-	h1DialContext := func(ctx context.Context, _, _ string) (net.Conn, error) {
-		// 优先消费从 H2 降级移交过来的连接
-		if stashed := wrapper.popStashedConn(); stashed != nil {
-			return wrapper.trackConn(stashed)
-		}
-		resultConn, err := wrapper.dialContext(ctx)
-		if err != nil {
-			return nil, err
-		}
-		return wrapper.trackConn(resultConn)
-	}
-
 	wrapper.httpTransport = &http.Transport{
-		DialContext:         h1DialContext,
-		DialTLSContext:      h1DialContext,
+		// DialContext 只在 http 明文请求时使用
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return wrapper.dial(ctx, dialPlain)
+		},
+		// DialTLSContext 在 https 请求时使用（拨号器已内置 TLS）
+		DialTLSContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return wrapper.dial(ctx, dialHTTP1)
+		},
+		// 非 nil 的空 map：明确禁止 http.Transport 自带的 h2 升级
+		TLSNextProto:        make(map[string]func(string, *stdtls.Conn) http.RoundTripper),
 		ForceAttemptHTTP2:   false,
+		DisableCompression:  true,
 		MaxIdleConns:        h1MaxIdleConns,
 		MaxIdleConnsPerHost: h1MaxIdleConnsPerHost,
-		IdleConnTimeout:     h1IdleConnTimeout,
+		IdleConnTimeout:     wrapperIdleTimeout,
 	}
-
 	return wrapper
 }
 
-func (h *HTTPSTransportWrapper) RoundTrip(request *http.Request) (*http.Response, error) {
-	// 快速失败检查：如果 Wrapper 已关闭，直接拒绝请求
-	select {
-	case <-h.closeCtx.Done():
-		return nil, net.ErrClosed
-	default:
+// dial 始终连接到 serverAddr（忽略 URL 中的地址），并按模式校验 ALPN。
+func (h *HTTPSTransportWrapper) dial(ctx context.Context, mode dialMode) (net.Conn, error) {
+	if h.isClosed() {
+		return nil, errTransportClosed
 	}
-
-	if h.fallback.Load() {
-		// 自动恢复探测：若非明文 HTTP，且距离上次降级已超过冷却时间，尝试切回 H2
-		if !h.permanentH1 && h.shouldAttemptRecovery() {
-			if h.fallback.CompareAndSwap(true, false) {
-				return h.roundTripH2(request)
+	dialCtx, cancel := context.WithTimeout(ctx, wrapperDialTimeout)
+	defer cancel()
+	conn, err := h.dialer.DialContext(dialCtx, N.NetworkTCP, h.serverAddr)
+	if err != nil {
+		return nil, err
+	}
+	if mode != dialPlain {
+		if tlsConn, isTLSConn := conn.(tls.Conn); isTLSConn {
+			negotiatedHTTP2 := tlsConn.ConnectionState().NegotiatedProtocol == http2.NextProtoTLS
+			if negotiatedHTTP2 != (mode == dialHTTP2) {
+				_ = conn.Close()
+				h.fallback.Store(!negotiatedHTTP2)
+				if mode == dialHTTP2 {
+					return nil, errFallback
+				}
+				return nil, errUseHTTP2
 			}
 		}
-		return h.httpTransport.RoundTrip(request)
 	}
-	return h.roundTripH2(request)
+	return h.trackConn(conn)
 }
 
-func (h *HTTPSTransportWrapper) roundTripH2(request *http.Request) (*http.Response, error) {
-	response, err := h.http2Transport.RoundTrip(request)
+func (h *HTTPSTransportWrapper) RoundTrip(request *http.Request) (*http.Response, error) {
+	if err := h.beginRequest(); err != nil {
+		return nil, err
+	}
+	response, err := h.roundTrip(request)
 	if err != nil {
-		if errors.Is(err, errFallback) {
-			// 修复 Body 复用隐患：http2Transport 失败时可能会关闭原始 request.Body，
-			// 因此在降级重试前通过 GetBody 重置请求体。
-			retryReq := request
-			if request.GetBody != nil {
-				if newBody, bodyErr := request.GetBody(); bodyErr == nil {
-					retryReq = request.Clone(request.Context())
-					retryReq.Body = newBody
-				}
-			}
-			return h.httpTransport.RoundTrip(retryReq)
+		h.endRequest()
+		// wrapper 被关闭导致的失败（且不是调用方自己取消/超时），统一返回可重试的错误
+		if h.isClosed() && request.Context().Err() == nil && !errors.Is(err, errTransportClosed) {
+			return nil, fmt.Errorf("%w (%v)", errTransportClosed, err)
 		}
 		return nil, err
 	}
+	// 响应体关闭时才算请求结束，用于空闲计时与优雅关闭
+	response.Body = &httpsTrackedBody{ReadCloser: response.Body, onClose: h.endRequest}
 	return response, nil
 }
 
-func (h *HTTPSTransportWrapper) shouldAttemptRecovery() bool {
-	lastNano := h.fallbackAtNano.Load()
-	if lastNano == 0 {
-		return false
+func (h *HTTPSTransportWrapper) roundTrip(request *http.Request) (*http.Response, error) {
+	// 明文 http 固定走 HTTP/1.1
+	if request.URL.Scheme != "https" {
+		return h.httpTransport.RoundTrip(request)
 	}
-	return time.Since(time.Unix(0, lastNano)) >= fallbackRecoveryInterval
+	useHTTP1 := h.fallback.Load()
+	response, err := h.roundTripVia(request, useHTTP1)
+	if err == nil {
+		return response, nil
+	}
+	if (useHTTP1 && errors.Is(err, errUseHTTP2)) || (!useHTTP1 && errors.Is(err, errFallback)) {
+		// 协商结果与预期不符：fallback 已在 dial 中更新，换另一个协议重试一次
+		retry, cloneErr := cloneReplayable(request)
+		if cloneErr != nil {
+			return nil, err
+		}
+		return h.roundTripVia(retry, !useHTTP1)
+	}
+	return nil, err
 }
 
-// dialContext 将单次请求的 ctx 与 Wrapper 的 closeCtx 绑定，确保 Close() 能立即中断正在进行的握手
-func (h *HTTPSTransportWrapper) dialContext(ctx context.Context) (net.Conn, error) {
-	select {
-	case <-h.closeCtx.Done():
-		return nil, net.ErrClosed
-	default:
+func (h *HTTPSTransportWrapper) roundTripVia(request *http.Request, useHTTP1 bool) (*http.Response, error) {
+	if useHTTP1 {
+		return h.httpTransport.RoundTrip(request)
 	}
-
-	dialCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	// 当 h.closeCtx 被取消时，自动触发 dialCtx 的 cancel()
-	stop := context.AfterFunc(h.closeCtx, cancel)
-	defer stop()
-
-	return h.dialer.DialContext(dialCtx, N.NetworkTCP, h.serverAddr)
+	return h.http2Transport.RoundTrip(request)
 }
 
-func (h *HTTPSTransportWrapper) stashConn(conn net.Conn) {
-	h.connAccess.Lock()
+// cloneReplayable 用 GetBody 重建请求体，不依赖第一次尝试后 Body 的状态。
+func cloneReplayable(request *http.Request) (*http.Request, error) {
+	clone := request.Clone(request.Context())
+	if request.Body != nil && request.Body != http.NoBody {
+		if request.GetBody == nil {
+			return nil, errors.New("dns over https: request body is not replayable")
+		}
+		body, err := request.GetBody()
+		if err != nil {
+			return nil, err
+		}
+		clone.Body = body
+	}
+	return clone, nil
+}
+
+func (h *HTTPSTransportWrapper) isClosed() bool {
+	h.access.Lock()
+	defer h.access.Unlock()
+	return h.closed
+}
+
+func (h *HTTPSTransportWrapper) beginRequest() error {
+	h.access.Lock()
+	defer h.access.Unlock()
 	if h.closed {
-		h.connAccess.Unlock()
-		conn.Close()
+		return errTransportClosed
+	}
+	h.inflight++
+	if h.idleTimer != nil {
+		h.idleTimer.Stop()
+		h.idleTimer = nil
+	}
+	return nil
+}
+
+func (h *HTTPSTransportWrapper) endRequest() {
+	h.access.Lock()
+	h.inflight--
+	if h.closed || h.inflight > 0 {
+		h.access.Unlock()
 		return
 	}
-	oldStashed := h.stashedConn
-	h.stashedConn = conn
-	h.connAccess.Unlock()
-
-	if oldStashed != nil {
-		oldStashed.Close()
+	if h.draining {
+		h.access.Unlock()
+		h.Close()
+		return
 	}
+	// 完全空闲：计时后清理空闲连接（h2 transport 自身没有空闲超时）
+	h.idleTimer = time.AfterFunc(wrapperIdleTimeout, h.CloseIdleConnections)
+	h.access.Unlock()
 }
 
-func (h *HTTPSTransportWrapper) popStashedConn() net.Conn {
-	h.connAccess.Lock()
-	defer h.connAccess.Unlock()
-	conn := h.stashedConn
-	h.stashedConn = nil
-	return conn
+// CloseIdleConnections 只关闭空闲连接，不影响在途请求。
+func (h *HTTPSTransportWrapper) CloseIdleConnections() {
+	h.http2Transport.CloseIdleConnections()
+	h.httpTransport.CloseIdleConnections()
 }
 
-func (h *HTTPSTransportWrapper) trackConn(conn net.Conn) (net.Conn, error) {
-	trackedConn := &httpsTrackedConn{Conn: conn, wrapper: h}
-	h.connAccess.Lock()
-	if h.closed {
-		h.connAccess.Unlock()
-		conn.Close()
-		return nil, net.ErrClosed
+// Shutdown 优雅关闭：立即清理空闲连接，在途请求全部结束或宽限期到后再强制关闭。
+func (h *HTTPSTransportWrapper) Shutdown(grace time.Duration) {
+	h.access.Lock()
+	if h.closed || h.draining {
+		h.access.Unlock()
+		return
 	}
-	h.connections[trackedConn] = struct{}{}
-	h.connAccess.Unlock()
-	return trackedConn, nil
+	h.draining = true
+	if h.idleTimer != nil {
+		h.idleTimer.Stop()
+		h.idleTimer = nil
+	}
+	if h.inflight == 0 {
+		h.access.Unlock()
+		h.Close()
+		return
+	}
+	h.drainTimer = time.AfterFunc(grace, h.Close)
+	h.access.Unlock()
+	h.CloseIdleConnections()
 }
 
+// Close 立即关闭所有连接，包括被在途请求占用的连接。可重复调用。
 func (h *HTTPSTransportWrapper) Close() {
-	// 1. 立即取消所有正在拨号/握手中的请求
-	h.closeCancel()
-
-	// 2. 取出所有活跃连接与暂存连接
-	h.connAccess.Lock()
+	h.access.Lock()
 	if h.closed {
-		h.connAccess.Unlock()
+		h.access.Unlock()
 		return
 	}
 	h.closed = true
-	stashed := h.stashedConn
-	h.stashedConn = nil
-
+	if h.idleTimer != nil {
+		h.idleTimer.Stop()
+		h.idleTimer = nil
+	}
+	if h.drainTimer != nil {
+		h.drainTimer.Stop()
+		h.drainTimer = nil
+	}
 	connections := make([]*httpsTrackedConn, 0, len(h.connections))
 	for trackedConn := range h.connections {
 		connections = append(connections, trackedConn)
 	}
 	h.connections = nil
-	h.connAccess.Unlock()
+	h.access.Unlock()
 
-	// 3. 在锁外安全关闭所有连接
-	if stashed != nil {
-		stashed.Close()
-	}
+	// 锁外关闭，避免与 httpsTrackedConn.Close 的加锁冲突
 	for _, trackedConn := range connections {
-		trackedConn.Close()
+		_ = trackedConn.Conn.Close()
 	}
 	h.CloseIdleConnections()
 }
 
-func (h *HTTPSTransportWrapper) CloseIdleConnections() {
-	if stashed := h.popStashedConn(); stashed != nil {
-		stashed.Close()
+func (h *HTTPSTransportWrapper) trackConn(conn net.Conn) (net.Conn, error) {
+	trackedConn := &httpsTrackedConn{Conn: conn, wrapper: h}
+	h.access.Lock()
+	if h.closed {
+		h.access.Unlock()
+		_ = conn.Close()
+		return nil, errTransportClosed
 	}
-	h.http2Transport.CloseIdleConnections()
-	h.httpTransport.CloseIdleConnections()
+	h.connections[trackedConn] = struct{}{}
+	h.access.Unlock()
+	return trackedConn, nil
 }
 
+func (h *HTTPSTransportWrapper) untrackConn(conn *httpsTrackedConn) {
+	h.access.Lock()
+	if h.connections != nil {
+		delete(h.connections, conn)
+	}
+	h.access.Unlock()
+}
+
+// httpsTrackedConn 登记所有已建立的连接，使 Close 能真正关闭在途连接。
 type httpsTrackedConn struct {
 	net.Conn
-	wrapper   *HTTPSTransportWrapper
-	closeOnce sync.Once
-	closeErr  error
+	wrapper *HTTPSTransportWrapper
+	once    sync.Once
 }
 
-// Close 使用 sync.Once 保证幂等，防止 Wrapper.Close() 与 Transport 并发重复关闭底层 FD
 func (c *httpsTrackedConn) Close() error {
-	c.closeOnce.Do(func() {
-		c.wrapper.connAccess.Lock()
-		delete(c.wrapper.connections, c)
-		c.wrapper.connAccess.Unlock()
-		c.closeErr = c.Conn.Close()
-	})
-	return c.closeErr
+	c.once.Do(func() { c.wrapper.untrackConn(c) })
+	return c.Conn.Close()
 }
 
-// Upstream 实现 sing 的 common.WithUpstream 接口，确保底层连接特性（如 TLS 状态、系统 FD）不被遮蔽
-func (c *httpsTrackedConn) Upstream() any {
-	return c.Conn
+// httpsTrackedBody 在响应体关闭时通知 wrapper 请求已结束。
+type httpsTrackedBody struct {
+	io.ReadCloser
+	once    sync.Once
+	onClose func()
+}
+
+func (b *httpsTrackedBody) Close() error {
+	err := b.ReadCloser.Close()
+	b.once.Do(b.onClose)
+	return err
 }
