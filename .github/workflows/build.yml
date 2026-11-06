@@ -26,7 +26,6 @@ on:
           - macOS-standalone
           - iOS-jailbreak
           - publish-android
-          - Windows-binary
       test_message:
         description: "TestFlight test message"
         required: false
@@ -572,7 +571,7 @@ jobs:
           path: "dist"
   build_windows:
     name: Build Windows binaries
-    if: github.event_name != 'workflow_dispatch' || inputs.build == 'All' || inputs.build == 'Binary'
+    if: github.event_name != 'workflow_dispatch' || inputs.build == 'All' || inputs.build == 'Binary' || inputs.build == 'Windows'
     runs-on: windows-latest
     needs:
       - calculate_version
@@ -953,7 +952,7 @@ jobs:
           LOCAL_PROPERTIES: ${{ secrets.LOCAL_PROPERTIES }}
   build_windows_client:
     name: Build Windows client (${{ matrix.desktop_arch }})
-    if: (github.event_name != 'workflow_dispatch' || inputs.build == 'All' || inputs.build == 'Windows') && github.ref != 'refs/heads/oldstable'
+    if: (github.event_name != 'workflow_dispatch' || inputs.build == 'All') && github.ref != 'refs/heads/oldstable'
     runs-on: windows-latest
     needs:
       - calculate_version
