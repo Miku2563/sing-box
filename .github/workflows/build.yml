@@ -26,6 +26,7 @@ on:
           - macOS-standalone
           - iOS-jailbreak
           - publish-android
+          - Windows-binary
       test_message:
         description: "TestFlight test message"
         required: false
