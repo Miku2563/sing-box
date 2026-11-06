@@ -3,13 +3,14 @@ package transport
 import (
 	"bytes"
 	"context"
-	"crypto/tls"
 	"errors"
 	"io"
+	"mime"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
-	"strings"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -17,7 +18,7 @@ import (
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/badhttp"
 	"github.com/sagernet/sing-box/common/dialer"
-	sTLS "github.com/sagernet/sing-box/common/tls"
+	"github.com/sagernet/sing-box/common/tls"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/dns"
 	"github.com/sagernet/sing-box/log"
@@ -36,24 +37,29 @@ import (
 const (
 	MimeType = "application/dns-message"
 
-	// 连续超时达到多少次才重置底层连接池（避免单次丢包误杀健康的 HTTP/2 多路复用连接）
-	maxConsecutiveTimeouts = 3
-
-	// ExchangeAsync 最大并发协程数限制（防止 DNS 风暴导致 Goroutine 暴涨 OOM）
-	maxAsyncConcurrency = 64
-
-	// DNS 报文最大合法尺寸 (64KB)，防止恶意服务端 Chunked 响应打爆内存
+	// DNS 报文理论上限
 	maxDNSMessageSize = 65535
+	// 非 200 响应最多排空的字节数，便于 HTTP/1.1 连接复用
+	maxDrainSize = 4096
 
-	// 当降级到 HTTP/1.1 后，尝试恢复到 HTTP/2 的探测间隔
-	fallbackRecoveryInterval = 5 * time.Minute
+	// ExchangeAsync 同时在途的最大查询数，超过则快速失败
+	maxAsyncInFlight = 1024
+
+	// 超时自愈策略
+	// - 复用连接上超时：连接大概率已失效，立即重置
+	// - 新连接上超时：重置也无济于事，连续达到该次数才重置
+	timeoutResetThreshold = 3
+	// 两次重置的最小间隔，防止调用方超时设置过短导致反复重置
+	resetCooldown = 5 * time.Second
+	// 优雅重置时，旧 transport 上在途请求的最长等待时间
+	drainGrace = 10 * time.Second
 )
+
+var ErrTooManyRequests = errors.New("dns over https: too many concurrent async queries")
 
 var (
 	_ adapter.DNSTransport         = (*HTTPSTransport)(nil)
 	_ adapter.IdleConnectionKeeper = (*HTTPSTransport)(nil)
-
-	errFallback = errors.New("fallback to http/1.1")
 )
 
 func RegisterHTTPS(registry *dns.TransportRegistry) {
@@ -62,46 +68,49 @@ func RegisterHTTPS(registry *dns.TransportRegistry) {
 
 type HTTPSTransport struct {
 	dns.TransportAdapter
-	logger              logger.ContextLogger
-	dialer              N.Dialer
-	destination         *url.URL
-	headers             http.Header
-	serverAddr          M.Socksaddr
-	fallback            *atomic.Bool
-	plainHTTP           bool
-	keepIdle            atomic.Bool
-	consecutiveTimeouts atomic.Uint32
-	asyncSem            chan struct{}
-	transportAccess     sync.Mutex
-	transport           *HTTPSTransportWrapper
-	transportResetAt    time.Time
+	logger         logger.ContextLogger
+	dialer         N.Dialer
+	destination    *url.URL
+	destinationURL string
+	headers        http.Header
+	serverAddr     M.Socksaddr
+	fallback       *atomic.Bool
+	keepIdle       atomic.Bool
+
+	transportAccess  sync.Mutex
+	transport        *HTTPSTransportWrapper
+	transportResetAt time.Time
+
+	consecutiveTimeouts atomic.Int32
+	asyncSlots          chan struct{}
 }
 
-func NewHTTPS(ctx context.Context, logger log.ContextLogger, tag string, options option.RemoteHTTPSDNSServerOptions) (adapter.DNSTransport, error) {
+func NewHTTPS(ctx context.Context, contextLogger log.ContextLogger, tag string, options option.RemoteHTTPSDNSServerOptions) (adapter.DNSTransport, error) {
 	transportDialer, err := dns.NewRemoteDialer(ctx, options.RemoteDNSServerOptions)
 	if err != nil {
 		return nil, err
 	}
 	tlsOptions := common.PtrValueOrDefault(options.TLS)
 	tlsOptions.Enabled = true
-	tlsConfig, err := sTLS.NewClient(ctx, logger, options.Server, tlsOptions)
+	tlsConfig, err := tls.NewClient(ctx, contextLogger, options.Server, tlsOptions)
 	if err != nil {
 		return nil, err
 	}
 	if len(tlsConfig.NextProtos()) == 0 {
 		tlsConfig.SetNextProtos([]string{http2.NextProtoTLS, "http/1.1"})
 	}
+
 	headers := options.Headers.Build()
 	host := headers.Get("Host")
 	if host != "" {
+		// Go 的 http 客户端忽略 Header 中的 Host，需要体现在 URL 中
 		headers.Del("Host")
+	} else if tlsConfig.ServerName() != "" {
+		host = tlsConfig.ServerName()
 	} else {
-		if tlsConfig.ServerName() != "" {
-			host = tlsConfig.ServerName()
-		} else {
-			host = options.Server
-		}
+		host = options.Server
 	}
+
 	destinationAddress := M.ParseSocksaddrHostPort(host, options.ServerPort)
 	destinationURL := url.URL{Scheme: "https"}
 	if options.ServerPort != 0 && options.ServerPort != 443 {
@@ -111,6 +120,7 @@ func NewHTTPS(ctx context.Context, logger log.ContextLogger, tag string, options
 	} else {
 		destinationURL.Host = destinationAddress.AddrString()
 	}
+
 	path := options.Path
 	if path == "" {
 		path = "/dns-query"
@@ -119,6 +129,7 @@ func NewHTTPS(ctx context.Context, logger log.ContextLogger, tag string, options
 	if err != nil {
 		return nil, err
 	}
+
 	serverAddr := options.DNSServerAddressOptions.Build()
 	if serverAddr.Port == 0 {
 		serverAddr.Port = 443
@@ -126,9 +137,10 @@ func NewHTTPS(ctx context.Context, logger log.ContextLogger, tag string, options
 	if !serverAddr.IsValid() {
 		return nil, E.New("invalid server address: ", serverAddr)
 	}
+
 	return NewHTTPSRaw(
 		dns.NewTransportAdapterWithRemoteOptions(C.DNSTypeHTTPS, tag, options.RemoteDNSServerOptions),
-		logger,
+		contextLogger,
 		transportDialer,
 		&destinationURL,
 		headers,
@@ -137,35 +149,35 @@ func NewHTTPS(ctx context.Context, logger log.ContextLogger, tag string, options
 	), nil
 }
 
+// NewHTTPSRaw 参数名避免遮蔽同名导入包。
 func NewHTTPSRaw(
-	adapter dns.TransportAdapter,
-	logger log.ContextLogger,
-	dialer N.Dialer,
+	transportAdapter dns.TransportAdapter,
+	contextLogger log.ContextLogger,
+	baseDialer N.Dialer,
 	destination *url.URL,
 	headers http.Header,
 	serverAddr M.Socksaddr,
-	tlsConfig sTLS.Config,
+	tlsConfig tls.Config,
 ) *HTTPSTransport {
 	if tlsConfig != nil {
-		dialer = sTLS.NewDialer(dialer, tlsConfig)
+		baseDialer = tls.NewDialer(baseDialer, tlsConfig)
 	}
 	fallback := new(atomic.Bool)
-	plainHTTP := destination.Scheme == "http"
-	if plainHTTP {
+	if destination.Scheme == "http" {
 		// plain HTTP DoH used by Tailscale
 		fallback.Store(true)
 	}
 	transport := &HTTPSTransport{
-		TransportAdapter: adapter,
-		logger:           logger,
-		dialer:           dialer,
+		TransportAdapter: transportAdapter,
+		logger:           contextLogger,
+		dialer:           baseDialer,
 		destination:      destination,
+		destinationURL:   destination.String(),
 		headers:          headers,
 		serverAddr:       serverAddr,
 		fallback:         fallback,
-		plainHTTP:        plainHTTP,
-		asyncSem:         make(chan struct{}, maxAsyncConcurrency),
-		transport:        NewHTTPSTransportWrapper(dialer, serverAddr, fallback, plainHTTP),
+		transport:        NewHTTPSTransportWrapper(baseDialer, serverAddr, fallback),
+		asyncSlots:       make(chan struct{}, maxAsyncInFlight),
 	}
 	transport.keepIdle.Store(true)
 	return transport
@@ -176,25 +188,20 @@ func (t *HTTPSTransport) Start(stage adapter.StartStage, scope *adapter.Scope) e
 		return nil
 	}
 	scope.Add(func() error {
-		t.Close()
+		t.Reset()
 		return nil
 	})
 	return dialer.InitializeDetour(t.dialer)
 }
 
-func (t *HTTPSTransport) Close() error {
-	t.transportAccess.Lock()
-	defer t.transportAccess.Unlock()
-	if t.transport != nil {
-		t.transport.Close()
-	}
-	return nil
-}
-
+// Reset 硬重置：立即丢弃并关闭所有连接（包括在途请求）。
+// 用于外部触发的场景（网络变化、关闭等），此时旧连接已无保留价值。
 func (t *HTTPSTransport) Reset() {
 	t.transportAccess.Lock()
-	defer t.transportAccess.Unlock()
-	t.resetTransportLocked()
+	oldTransport := t.swapTransportLocked()
+	t.transportAccess.Unlock()
+	t.consecutiveTimeouts.Store(0)
+	oldTransport.Close()
 }
 
 func (t *HTTPSTransport) SetKeepIdleConnections(keep bool) {
@@ -206,379 +213,213 @@ func (t *HTTPSTransport) SetKeepIdleConnections(keep bool) {
 
 func (t *HTTPSTransport) CloseIdleConnections() {
 	t.transportAccess.Lock()
-	defer t.transportAccess.Unlock()
-	t.transport.CloseIdleConnections()
+	current := t.transport
+	t.transportAccess.Unlock()
+	current.CloseIdleConnections()
 }
 
-func (t *HTTPSTransport) resetTransportLocked() {
+// swapTransportLocked 必须持有 transportAccess 调用，返回旧 transport，由调用方解锁后处理。
+func (t *HTTPSTransport) swapTransportLocked() *HTTPSTransportWrapper {
 	oldTransport := t.transport
-	t.transport = NewHTTPSTransportWrapper(t.dialer, t.serverAddr, t.fallback, t.plainHTTP)
+	t.transport = NewHTTPSTransportWrapper(t.dialer, t.serverAddr, t.fallback)
 	t.transportResetAt = time.Now()
-	t.consecutiveTimeouts.Store(0)
-	if oldTransport != nil {
-		oldTransport.Close()
-	}
+	return oldTransport
+}
+
+func (t *HTTPSTransport) currentTransport() *HTTPSTransportWrapper {
+	t.transportAccess.Lock()
+	defer t.transportAccess.Unlock()
+	return t.transport
 }
 
 func (t *HTTPSTransport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {
 	startAt := time.Now()
-	response, err := t.exchange(ctx, message)
+	trace := new(requestTrace)
+	response, err := t.exchange(ctx, message, trace)
 	if !t.keepIdle.Load() {
 		t.CloseIdleConnections()
 	}
 	if err != nil {
-		if errors.Is(err, context.DeadlineExceeded) {
-			count := t.consecutiveTimeouts.Add(1)
-			if count >= maxConsecutiveTimeouts {
-				t.transportAccess.Lock()
-				// 防惊群检查：确保同一批并发超时请求只会触发一次重置
-				if !t.transportResetAt.After(startAt) {
-					t.logger.WarnContext(ctx, "doh transport reset after ", count, " consecutive timeouts to ", t.serverAddr)
-					t.resetTransportLocked()
-				}
-				t.transportAccess.Unlock()
-			} else {
-				t.logger.DebugContext(ctx, "doh request timeout (", count, "/", maxConsecutiveTimeouts, ") to ", t.serverAddr)
-			}
-		}
+		t.handleExchangeError(ctx, startAt, trace, err)
 		return nil, err
 	}
-	// 只要有一次请求成功，说明底层连接健康，立即清零连续超时计数
-	t.consecutiveTimeouts.Store(0)
+	if t.consecutiveTimeouts.Load() != 0 {
+		t.consecutiveTimeouts.Store(0)
+	}
 	return response, nil
 }
 
-// ExchangeAsync 使用有界信号量控制并发度，避免极端情况下 Goroutine 泄漏或爆炸
+// ExchangeAsync 用信号量限制在途查询数量，超限时快速失败，避免 goroutine 无限增长。
 func (t *HTTPSTransport) ExchangeAsync(ctx context.Context, message *mDNS.Msg, callback func(response *mDNS.Msg, err error)) {
+	select {
+	case t.asyncSlots <- struct{}{}:
+	default:
+		go callback(nil, ErrTooManyRequests)
+		return
+	}
 	go func() {
-		select {
-		case t.asyncSem <- struct{}{}:
-			defer func() { <-t.asyncSem }()
-			callback(t.Exchange(ctx, message))
-		case <-ctx.Done():
-			callback(nil, ctx.Err())
-		}
+		response, err := t.Exchange(ctx, message)
+		<-t.asyncSlots // 先释放名额，再执行回调，避免回调耗时占用名额
+		callback(response, err)
 	}()
 }
 
-func (t *HTTPSTransport) exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {
-	exMessage := message.Copy()
-	exMessage.Id = 0
-	exMessage.Compress = true
-	requestBuffer := buf.NewSize(1 + message.Len())
-	rawMessage, err := exMessage.PackBuffer(requestBuffer.FreeBytes())
-	if err != nil {
-		requestBuffer.Release()
-		return nil, err
+// handleExchangeError 超时自愈策略。
+//
+//  1. 只处理超时类错误，取消、EOF、状态码错误等不触发。
+//  2. 请求落在"复用连接"上超时：连接大概率已半死，立即重置。
+//  3. 请求落在"新连接"（或根本没拿到连接）上超时：服务端慢或不可达，
+//     重置没有意义，仅在连续超时达到阈值后才重置。
+//  4. 重置有冷却时间，并发请求同时超时只会重置一次。
+//  5. 重置是"优雅"的：旧 transport 停止接收空闲连接，等在途请求结束或宽限期后才强制关闭。
+func (t *HTTPSTransport) handleExchangeError(ctx context.Context, startAt time.Time, trace *requestTrace, err error) {
+	if !isTimeout(err) {
+		return
 	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, t.destination.String(), bytes.NewReader(rawMessage))
-	if err != nil {
-		requestBuffer.Release()
-		return nil, err
+	count := t.consecutiveTimeouts.Add(1)
+	reusedConn := trace.reused.Load()
+	if !reusedConn && count < timeoutResetThreshold {
+		return
 	}
-	request.Header = t.headers.Clone()
-	request.Header.Set("Content-Type", MimeType)
-	request.Header.Set("Accept", MimeType)
 
 	t.transportAccess.Lock()
-	currentTransport := t.transport
+	if t.transportResetAt.After(startAt) || time.Since(t.transportResetAt) < resetCooldown {
+		t.transportAccess.Unlock()
+		return
+	}
+	oldTransport := t.swapTransportLocked()
 	t.transportAccess.Unlock()
+	t.consecutiveTimeouts.Store(0)
 
-	response, err := currentTransport.RoundTrip(request)
-	requestBuffer.Release()
+	t.logger.DebugContext(ctx, "dns over https: transport reset after timeout (reused connection: ", reusedConn, ", consecutive timeouts: ", count, ")")
+	oldTransport.Shutdown(drainGrace)
+}
+
+func isTimeout(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, os.ErrDeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
+// requestTrace 记录请求是否落在复用连接上。
+type requestTrace struct {
+	reused atomic.Bool
+}
+
+func (r *requestTrace) clientTrace() *httptrace.ClientTrace {
+	return &httptrace.ClientTrace{
+		GotConn: func(info httptrace.GotConnInfo) {
+			r.reused.Store(info.Reused)
+		},
+	}
+}
+
+func (t *HTTPSTransport) exchange(ctx context.Context, message *mDNS.Msg, trace *requestTrace) (*mDNS.Msg, error) {
+	// 必须深拷贝：Pack 可能修改共享的 OPT RR，浅拷贝会污染调用方报文
+	exMessage := message.Copy()
+	exMessage.Id = 0 // RFC 8484：使用 ID 0 以利于 HTTP 缓存
+	exMessage.Compress = true
+
+	// 直接 Pack 得到独立切片，不使用对象池：
+	// 请求体的生命周期由 HTTP 层决定，独立内存可彻底避免"提前归还缓冲区"的数据竞争，
+	// 同时让重试时可以反复使用同一份 payload。
+	payload, err := exMessage.Pack()
+	if err != nil {
+		return nil, err
+	}
+
+	response, err := t.roundTrip(ctx, payload, trace)
 	if err != nil {
 		return nil, err
 	}
 	defer response.Body.Close()
 
 	if response.StatusCode != http.StatusOK {
+		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, maxDrainSize))
 		return nil, E.New("unexpected status: ", response.Status)
 	}
+	return t.readResponse(ctx, response)
+}
 
-	// 兼容性 Content-Type 校验（忽略参数如 "; charset=utf-8" 及大小写差异）
-	if contentType := response.Header.Get("Content-Type"); contentType != "" {
-		if !isValidDNSContentType(contentType) {
-			return nil, E.New("unexpected content-type: ", contentType)
+func (t *HTTPSTransport) roundTrip(ctx context.Context, payload []byte, trace *requestTrace) (*http.Response, error) {
+	requestContext := httptrace.WithClientTrace(ctx, trace.clientTrace())
+	for attempt := 0; ; attempt++ {
+		request, err := http.NewRequestWithContext(requestContext, http.MethodPost, t.destinationURL, bytes.NewReader(payload))
+		if err != nil {
+			return nil, err
 		}
+		request.Header = t.headers.Clone()
+		request.Header.Set("Content-Type", MimeType)
+		request.Header.Set("Accept", MimeType)
+
+		response, err := t.currentTransport().RoundTrip(request)
+		// 请求刚好撞上 transport 被替换并关闭：请求尚未发出，重新取新的 transport 重试一次
+		if err != nil && attempt == 0 && errors.Is(err, errTransportClosed) {
+			continue
+		}
+		return response, err
+	}
+}
+
+func (t *HTTPSTransport) readResponse(ctx context.Context, response *http.Response) (*mDNS.Msg, error) {
+	if response.ContentLength > maxDNSMessageSize {
+		return nil, E.New("response too large: ", response.ContentLength)
 	}
 
-	var responseMessage mDNS.Msg
+	var (
+		responseMessage mDNS.Msg
+		unpackErr       error
+	)
 	if response.ContentLength > 0 {
-		if response.ContentLength > maxDNSMessageSize {
-			return nil, E.New("response too large: ", response.ContentLength)
-		}
 		responseBuffer := buf.NewSize(int(response.ContentLength))
 		defer responseBuffer.Release()
-		_, err = responseBuffer.ReadFullFrom(response.Body, int(response.ContentLength))
+		_, err := responseBuffer.ReadFullFrom(response.Body, int(response.ContentLength))
 		if err != nil {
 			return nil, err
 		}
-		err = responseMessage.Unpack(responseBuffer.Bytes())
+		unpackErr = responseMessage.Unpack(responseBuffer.Bytes())
 	} else {
-		// 限制最大读取字节数，防止恶意 Chunked 响应耗尽内存
-		rawMessage, err = io.ReadAll(io.LimitReader(response.Body, maxDNSMessageSize+1))
+		// 未知长度：多读 1 字节用于检测超限
+		body, err := io.ReadAll(io.LimitReader(response.Body, maxDNSMessageSize+1))
 		if err != nil {
 			return nil, err
 		}
-		if len(rawMessage) > maxDNSMessageSize {
-			return nil, E.New("response body exceeds maximum DNS message size")
+		if len(body) > maxDNSMessageSize {
+			return nil, E.New("response too large")
 		}
-		err = responseMessage.Unpack(rawMessage)
+		if len(body) == 0 {
+			return nil, E.New("empty response")
+		}
+		unpackErr = responseMessage.Unpack(body)
 	}
-	if err != nil {
-		return nil, err
+
+	// Content-Type 采用"宽松接受 + 失败时诊断"策略：
+	// 报文能正常解析就接受（兼容不规范的服务端）；
+	// 解析失败且类型不对，则在错误里带上类型，便于识别中间设备返回的 HTML 等。
+	contentType := response.Header.Get("Content-Type")
+	typeOK := isDNSContentType(contentType)
+	if unpackErr != nil {
+		if !typeOK {
+			return nil, E.Cause(unpackErr, "unexpected content type ", contentType)
+		}
+		return nil, unpackErr
 	}
-	// 恢复原始 DNS 请求 ID，确保上层依赖 ID 匹配的调用方正常工作
-	responseMessage.Id = message.Id
+	if !typeOK {
+		t.logger.DebugContext(ctx, "dns over https: non-standard content type: ", contentType)
+	}
 	return &responseMessage, nil
 }
 
-// isValidDNSContentType 零内存分配（Zero-Allocation）校验 Media-Type
-func isValidDNSContentType(contentType string) bool {
-	mediaType, _, _ := strings.Cut(contentType, ";")
-	mediaType = strings.TrimSpace(mediaType)
-	return strings.EqualFold(mediaType, MimeType)
-}
-
-// ============================================================================
-// HTTPSTransportWrapper: 负责 H2/H1 无损降级、定时恢复探测与严格连接生命周期管理
-// ============================================================================
-
-type HTTPSTransportWrapper struct {
-	dialer            N.Dialer
-	serverAddr        M.Socksaddr
-	fallback          *atomic.Bool
-	plainHTTP         bool
-	fallbackAtNano    atomic.Int64 // 记录降级发生的时间戳（用于定时恢复探测）
-
-	access            sync.Mutex
-	closed            bool
-	closeCtx          context.Context
-	closeCancel       context.CancelFunc
-	transport         *http2.Transport
-	fallbackTransport *http.Transport
-
-	// Stash 机制：当 H2 拨号握手完成后发现 ALPN 是 http/1.1 时，
-	// 暂存该连接直接移交给 H1 Transport 使用，避免关闭连接再重新握手的开销。
-	stashedConnAccess sync.Mutex
-	stashedConn       net.Conn
-}
-
-func NewHTTPSTransportWrapper(dialer N.Dialer, serverAddr M.Socksaddr, fallback *atomic.Bool, plainHTTP bool) *HTTPSTransportWrapper {
-	closeCtx, closeCancel := context.WithCancel(context.Background())
-	w := &HTTPSTransportWrapper{
-		dialer:      dialer,
-		serverAddr:  serverAddr,
-		fallback:    fallback,
-		plainHTTP:   plainHTTP,
-		closeCtx:    closeCtx,
-		closeCancel: closeCancel,
+// isDNSContentType 缺失视为合法；有值则按 media type 比较，忽略参数与大小写。
+func isDNSContentType(contentType string) bool {
+	if contentType == "" {
+		return true
 	}
-	if fallback.Load() && !plainHTTP {
-		w.fallbackAtNano.Store(time.Now().UnixNano())
-	}
-	return w
-}
-
-func (w *HTTPSTransportWrapper) RoundTrip(request *http.Request) (*http.Response, error) {
-	if w.fallback.Load() {
-		// Fallback 自动恢复机制：如果不是强制明文 HTTP，且距离上次降级已超过冷却时间，
-		// 则通过 CAS 尝试切回 HTTP/2 进行探测。
-		if !w.plainHTTP && w.shouldAttemptRecovery() {
-			if w.fallback.CompareAndSwap(true, false) {
-				return w.roundTripH2(request)
-			}
-		}
-		return w.roundTripFallback(request)
-	}
-	return w.roundTripH2(request)
-}
-
-func (w *HTTPSTransportWrapper) shouldAttemptRecovery() bool {
-	lastNano := w.fallbackAtNano.Load()
-	if lastNano == 0 {
+	mediaType, _, err := mime.ParseMediaType(contentType)
+	if err != nil {
 		return false
 	}
-	return time.Since(time.Unix(0, lastNano)) >= fallbackRecoveryInterval
-}
-
-func (w *HTTPSTransportWrapper) markFallback() {
-	w.fallbackAtNano.Store(time.Now().UnixNano())
-	w.fallback.Store(true)
-}
-
-func (w *HTTPSTransportWrapper) roundTripH2(request *http.Request) (*http.Response, error) {
-	w.access.Lock()
-	if w.closed {
-		w.access.Unlock()
-		return nil, net.ErrClosed
-	}
-	transport := w.transport
-	if transport == nil {
-		transport = &http2.Transport{
-			DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
-				conn, err := w.dialContext(ctx)
-				if err != nil {
-					return nil, err
-				}
-				// 检查 TLS ALPN 协商结果
-				if tlsConn, isTLS := common.Cast[sTLS.Conn](conn); isTLS {
-					state := tlsConn.ConnectionState()
-					if state.NegotiatedProtocol != http2.NextProtoTLS {
-						// 服务端不支持 h2，标记降级并将已建立的 TLS 连接暂存移交给 H1 复用
-						w.markFallback()
-						w.stashConn(conn)
-						return nil, errFallback
-					}
-				}
-				return conn, nil
-			},
-			ReadIdleTimeout: 30 * time.Second,
-			PingTimeout:     15 * time.Second,
-		}
-		w.transport = transport
-	}
-	w.access.Unlock()
-
-	response, err := transport.RoundTrip(request)
-	if err != nil {
-		// 捕获降级信号，无缝切换到 HTTP/1.1 并复用刚才暂存的连接完成本次请求
-		if errors.Is(err, errFallback) {
-			return w.roundTripFallback(request)
-		}
-		return nil, err
-	}
-	return response, nil
-}
-
-func (w *HTTPSTransportWrapper) roundTripFallback(request *http.Request) (*http.Response, error) {
-	w.access.Lock()
-	if w.closed {
-		w.access.Unlock()
-		return nil, net.ErrClosed
-	}
-	fallbackTransport := w.fallbackTransport
-	if fallbackTransport == nil {
-		dialFunc := func(ctx context.Context, network, addr string) (net.Conn, error) {
-			// 优先消费从 H2 降级移交过来的已握手连接，实现 0-RTT 无损降级
-			if stashed := w.popStashedConn(); stashed != nil {
-				return stashed, nil
-			}
-			return w.dialContext(ctx)
-		}
-		fallbackTransport = &http.Transport{
-			DialContext:           dialFunc,
-			DialTLSContext:        dialFunc,
-			ForceAttemptHTTP2:     false,
-			MaxIdleConns:          10,
-			MaxIdleConnsPerHost:   10,
-			IdleConnTimeout:       90 * time.Second,
-			TLSHandshakeTimeout:   10 * time.Second,
-			ExpectContinueTimeout: 1 * time.Second,
-		}
-		w.fallbackTransport = fallbackTransport
-	}
-	w.access.Unlock()
-	return fallbackTransport.RoundTrip(request)
-}
-
-// dialContext 绑定了 Wrapper 自身的 closeCtx，确保调用 Close() 时能立即中断正在进行的拨号
-func (w *HTTPSTransportWrapper) dialContext(ctx context.Context) (net.Conn, error) {
-	select {
-	case <-w.closeCtx.Done():
-		return nil, net.ErrClosed
-	default:
-	}
-
-	dialCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	stop := context.AfterFunc(w.closeCtx, cancel)
-	defer stop()
-
-	conn, err := w.dialer.DialContext(dialCtx, N.NetworkTCP, w.serverAddr)
-	if err != nil {
-		return nil, err
-	}
-
-	// 双重检查：如果在拨号刚完成的瞬间 Wrapper 被关闭，立即清理连接防止泄漏
-	select {
-	case <-w.closeCtx.Done():
-		conn.Close()
-		return nil, net.ErrClosed
-	default:
-		return conn, nil
-	}
-}
-
-func (w *HTTPSTransportWrapper) stashConn(conn net.Conn) {
-	w.stashedConnAccess.Lock()
-	defer w.stashedConnAccess.Unlock()
-	select {
-	case <-w.closeCtx.Done():
-		conn.Close()
-		return
-	default:
-	}
-	if w.stashedConn != nil {
-		w.stashedConn.Close()
-	}
-	w.stashedConn = conn
-}
-
-func (w *HTTPSTransportWrapper) popStashedConn() net.Conn {
-	w.stashedConnAccess.Lock()
-	defer w.stashedConnAccess.Unlock()
-	conn := w.stashedConn
-	w.stashedConn = nil
-	return conn
-}
-
-func (w *HTTPSTransportWrapper) clearStashedConn() {
-	if conn := w.popStashedConn(); conn != nil {
-		conn.Close()
-	}
-}
-
-func (w *HTTPSTransportWrapper) CloseIdleConnections() {
-	w.clearStashedConn()
-	w.access.Lock()
-	h2 := w.transport
-	h1 := w.fallbackTransport
-	w.access.Unlock()
-
-	if h2 != nil {
-		h2.CloseIdleConnections()
-	}
-	if h1 != nil {
-		h1.CloseIdleConnections()
-	}
-}
-
-func (w *HTTPSTransportWrapper) Close() {
-	// 1. 触发取消信号，立即中断所有在途的 dialContext 握手
-	w.closeCancel()
-	// 2. 清理暂存的降级连接
-	w.clearStashedConn()
-
-	// 3. 锁定并剥离底层 Transport 引用
-	w.access.Lock()
-	if w.closed {
-		w.access.Unlock()
-		return
-	}
-	w.closed = true
-	h2 := w.transport
-	h1 := w.fallbackTransport
-	w.transport = nil
-	w.fallbackTransport = nil
-	w.access.Unlock()
-
-	// 4. 在锁外关闭连接池，避免死锁
-	if h2 != nil {
-		h2.CloseIdleConnections()
-	}
-	if h1 != nil {
-		h1.CloseIdleConnections()
-	}
+	return mediaType == MimeType
 }
