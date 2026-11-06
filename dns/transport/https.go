@@ -1,28 +1,3 @@
-这份代码将你提到的所有痛点全部用**工业级最佳实践**进行了重构与补全，包含了完整的 `HTTPSTransport` 和 `HTTPSTransportWrapper` 实现。
-
-### 核心升级与修复亮点一览
-
-1. **智能连续超时重置策略（防误杀 + 防惊群 + 可观测日志）**：
-   * 引入原子计数器 `consecutiveTimeouts`（默认阈值 `3` 次）。单次网络抖动不再粗暴销毁整个 HTTP/2 连接池（避免误杀同连接上的其他正常 Stream）。
-   * 只有**连续超时达到阈值**时才触发重置；一旦有任意请求成功，计数器立即归零。
-   * 保留 `transportResetAt.After(startAt)` 时间戳比对，完美防御高并发下的“惊群重复重置”，并输出带计数的 Warn 日志。
-2. **`ExchangeAsync` 有界并发模型（信号量背压控制）**：
-   * 引入容量为 `64` 的轻量级信号量通道 `asyncSem`，防止在 DNS 风暴（如瞬间打开大量网页或遭遇环路）时产生数万个 Goroutine 导致内存暴涨（OOM）。
-   * 信号量获取与 `ctx.Done()` 绑定：若并发已满且请求超时，直接快速失败回调，绝不泄漏协程。
-3. **零内存分配（Zero-Allocation）的兼容性 `Content-Type` 校验**：
-   * 摒弃会产生 Map 内存分配的 `mime.ParseMediaType`，采用 `strings.Cut` + `strings.TrimSpace` + `strings.EqualFold` 实现**零分配解析**。
-   * 完美兼容大小写差异（如 `APPLICATION/DNS-MESSAGE`）以及附带参数（如 `application/dns-message; charset=utf-8`）。
-   * 增加 `io.LimitReader`（限制最大 64KB），防止恶意 DoH 服务端利用 Chunked 编码发送无限长数据打爆客户端内存。
-4. **满血版 `HTTPSTransportWrapper`（H2/H1 无损降级 + 定时探测恢复 + 严格 Close 语义）**：
-   * **ALPN 降级“连接零浪费”（Handoff 机制）**：当 H2 拨号完成了昂贵的 TCP+TLS 握手却发现服务端只支持 `http/1.1` 时，**不关闭该连接**，而是将其暂存（Stash）并直接移交给 H1 Transport 复用，省去二次握手的 RTT 开销！
-   * **Fallback 自动恢复机制**：记录降级时间戳 `fallbackAt`。若非明文 HTTP，每隔 `5 分钟`（`fallbackRecoveryInterval`）利用 CAS 原子操作自动尝试切回 HTTP/2 探测，避免因临时网络故障导致永久锁死在低效的 HTTP/1.1。
-   * **严格的 `Close` 生命周期**：内置 `closeCtx`，调用 `Close()` 时不仅清理空闲连接池和暂存连接，还会**立即中断正在进行中的底层 TCP/TLS 握手**。
-
----
-
-### 完整源码 (`dns/transport/https.go`)
-
-```go
 package transport
 
 import (
@@ -607,4 +582,3 @@ func (w *HTTPSTransportWrapper) Close() {
 		h1.CloseIdleConnections()
 	}
 }
-```
