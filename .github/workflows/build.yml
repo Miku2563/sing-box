@@ -51,6 +51,19 @@ jobs:
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
         with:
           fetch-depth: 0
+          fetch-tags: true
+      - name: Fetch and diagnose Git tags
+        run: |
+          set -x
+          git fetch --force --tags origin
+          echo "========== Remote =========="
+          git remote -v
+          echo "========== Current commit =========="
+          git log -1 --oneline --decorate
+          echo "========== Available tags =========="
+          git tag --list
+          echo "========== git describe =========="
+          git describe --tags || true
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
