@@ -5,10 +5,11 @@ import "time"
 const (
 	TCPKeepAliveInitial       = 40 * time.Second
 	TCPKeepAliveInterval      = 40 * time.Second
+	TCPKeepAliveCount         = 3 * time.Second
 	TCPConnectTimeout         = 5 * time.Second
 	TCPTimeout                = 15 * time.Second
 	ReadPayloadTimeout        = 300 * time.Millisecond
-	DNSTimeout                = 10 * time.Second
+	DNSTimeout                = 3 * time.Second
 	UDPTimeout                = 5 * time.Minute
 	ICMPTimeout               = 10 * time.Second
 	DefaultURLTestInterval    = 3 * time.Minute
