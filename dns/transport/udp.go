@@ -97,16 +97,22 @@ func (t *UDPTransport) Start(stage adapter.StartStage, scope *adapter.Scope) err
 	return dialer.InitializeDetour(t.dialer)
 }
 
-// Close 关闭传输并拒绝后续查询。
-func (t *UDPTransport) Close() {
+// Close 关闭传输并拒绝后续查询。可重复调用,返回值符合 scope.Add 的 func() error 签名。
+func (t *UDPTransport) Close() error {
 	t.mu.Lock()
+	if t.closed {
+		t.mu.Unlock()
+		return nil
+	}
 	t.closed = true
 	session := t.session
 	t.session = nil
 	t.mu.Unlock()
+
 	if session != nil {
 		session.close(E.New("DNS transport closed"))
 	}
+	return nil
 }
 
 // Reset 丢弃当前 session,下次查询时重新建立连接(例如网络切换后)。
@@ -115,6 +121,7 @@ func (t *UDPTransport) Reset() {
 	session := t.session
 	t.session = nil
 	t.mu.Unlock()
+
 	if session != nil {
 		session.close(E.New("DNS transport reset"))
 	}
@@ -128,6 +135,7 @@ func (t *UDPTransport) CloseIdleConnections() {
 	t.mu.Lock()
 	session := t.session
 	t.mu.Unlock()
+
 	if session != nil {
 		session.closeIfIdle()
 	}
