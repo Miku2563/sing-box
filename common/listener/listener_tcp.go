@@ -51,7 +51,7 @@ func (l *Listener) ListenTCP() (net.Listener, error) {
 		}
 		keepCount := l.listenOptions.TCPKeepAliveCount
 		if keepCount < 0 {
-			keepCount = 0
+			keepCount = C.TCPKeepAliveCount
 		}
 		listenConfig.KeepAliveConfig = net.KeepAliveConfig{
 			Enable:   true,
