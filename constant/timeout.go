@@ -5,7 +5,7 @@ import "time"
 const (
 	TCPKeepAliveInitial       = 40 * time.Second
 	TCPKeepAliveInterval      = 40 * time.Second
-	TCPKeepAliveCount         = 3 * time.Second
+	TCPKeepAliveCount         = 3
 	TCPConnectTimeout         = 5 * time.Second
 	TCPTimeout                = 15 * time.Second
 	ReadPayloadTimeout        = 300 * time.Millisecond
