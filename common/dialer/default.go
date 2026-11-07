@@ -183,6 +183,7 @@ func NewDefault(ctx context.Context, options option.DialerOptions) (*DefaultDial
 			Enable:   true,
 			Idle:     keepIdle,
 			Interval: keepInterval,
+			Count:    C.TCPKeepAliveCount,
 		}
 	}
 	var udpFragment bool
