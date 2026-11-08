@@ -32,9 +32,15 @@ const (
 	udpDefaultQueryTimeout = 5 * time.Second
 	udpDefaultIdleTimeout  = 30 * time.Second
 	udpMinEDNSSize         = 512
-	udpMaxEDNSSize         = 4096
-	udpMaxPacketSize       = 65535
-	udpMaxInflight         = 4096
+	// DNS Flag Day 2020 推荐值:超过约 1400 字节的 UDP 报文容易被 IP 分片并在网络中被丢弃
+	udpMaxEDNSSize   = 1232
+	udpMaxPacketSize = 65535
+	udpMaxInflight   = 4096
+
+	// 重传:发出后若在 udpRetransmitInterval 内没有应答,用同一 ID 重发一次。
+	// 剩余时间的一半小于该值时按一半计算;低于 udpMinRetransmit 则不重传。
+	udpRetransmitInterval = 1500 * time.Millisecond
+	udpMinRetransmit      = 300 * time.Millisecond
 )
 
 var (
@@ -47,7 +53,7 @@ func RegisterUDP(registry *dns.TransportRegistry) {
 }
 
 // UDPTransport 是基于单个已连接 UDP socket 的 DNS 传输实现。
-// 同一时刻复用一个 session 承载并发查询,超时截断时回退到 TCP。
+// 同一时刻复用一个 session 承载并发查询,超时无应答会重传一次,截断时回退到 TCP。
 type UDPTransport struct {
 	dns.TransportAdapter
 	logger logger.ContextLogger
@@ -116,6 +122,7 @@ func (t *UDPTransport) Close() error {
 }
 
 // Reset 丢弃当前 session,下次查询时重新建立连接(例如网络切换后)。
+// 在途查询会收到 udpSessionClosedError,并由 exchangeUDP 换新会话重试一次。
 func (t *UDPTransport) Reset() {
 	t.mu.Lock()
 	session := t.session
@@ -127,8 +134,21 @@ func (t *UDPTransport) Reset() {
 	}
 }
 
+// SetKeepIdleConnections 设置是否保持空闲连接。
+// 从 true 改回 false 时,需要为已有 session 重新武装空闲定时器,
+// 否则该 session 及其 readLoop 会一直存活。
 func (t *UDPTransport) SetKeepIdleConnections(keep bool) {
 	t.keepIdle.Store(keep)
+	if keep {
+		return
+	}
+	t.mu.Lock()
+	session := t.session
+	t.mu.Unlock()
+
+	if session != nil {
+		session.rearmIdle()
+	}
 }
 
 func (t *UDPTransport) CloseIdleConnections() {
@@ -172,15 +192,28 @@ func (t *UDPTransport) ExchangeAsync(ctx context.Context, message *mDNS.Msg, cal
 	}()
 }
 
+// exchangeUDP 在 UDP session 上完成一次查询。
+// 若会话在"获取之后、使用之前/期间"被关闭(空闲到期、Reset、CloseIdleConnections、读错误),
+// 换一个新会话重试一次,避免把本可恢复的失败暴露给调用方。
 func (t *UDPTransport) exchangeUDP(ctx context.Context, query *mDNS.Msg) (*mDNS.Msg, error) {
 	ctx, cancel := context.WithTimeout(ctx, t.queryTimeout)
 	defer cancel()
 
-	session, err := t.acquireSession(ctx)
-	if err != nil {
-		return nil, err
+	for attempt := 0; ; attempt++ {
+		session, err := t.acquireSession(ctx)
+		if err != nil {
+			return nil, err
+		}
+		response, err := session.exchange(ctx, query)
+		if err != nil && attempt == 0 && ctx.Err() == nil {
+			var closed *udpSessionClosedError
+			if errors.As(err, &closed) {
+				t.logger.DebugContext(ctx, "UDP session closed during query, retrying on a new session: ", err)
+				continue
+			}
+		}
+		return response, err
 	}
-	return session.exchange(ctx, query)
 }
 
 // acquireSession 返回可用 session,必要时建立新连接。
@@ -275,6 +308,13 @@ func (t *UDPTransport) exchangeTCP(ctx context.Context, query *mDNS.Msg) (*mDNS.
 // udpSession: 单个已连接 UDP socket 上的多路复用会话
 // ---------------------------------------------------------------------------
 
+// udpSessionClosedError 标记"会话已关闭"这一类可恢复错误,
+// 调用方可据此换新会话重试。
+type udpSessionClosedError struct{ cause error }
+
+func (e *udpSessionClosedError) Error() string { return e.cause.Error() }
+func (e *udpSessionClosedError) Unwrap() error { return e.cause }
+
 type udpSession struct {
 	conn        net.Conn
 	logger      logger.ContextLogger
@@ -345,6 +385,7 @@ func (s *udpSession) dispatch(response *mDNS.Msg) {
 	waiter := s.pending[response.Id]
 	if waiter == nil || !udpQuestionMatches(waiter.query, response) {
 		s.mu.Unlock()
+		// 重传后服务器可能应答两次,第二个包会走到这里,属于正常现象
 		s.logger.Debug("dropped unmatched UDP response, id=", response.Id)
 		return
 	}
@@ -357,6 +398,7 @@ func (s *udpSession) dispatch(response *mDNS.Msg) {
 
 // exchange 在该会话上发送一条查询并等待响应。
 // 调用方的 query 不会被修改:内部使用会话分配的 ID 发送,返回前恢复原 ID。
+// 发出后若在重传延迟内没有应答,用同一 ID 重发一次(只重传一次)。
 func (s *udpSession) exchange(ctx context.Context, query *mDNS.Msg) (*mDNS.Msg, error) {
 	id, pending, err := s.register(query)
 	if err != nil {
@@ -375,14 +417,30 @@ func (s *udpSession) exchange(ctx context.Context, query *mDNS.Msg) (*mDNS.Msg, 
 		return nil, E.Cause(err, "write UDP query")
 	}
 
-	select {
-	case response := <-pending.response:
-		response.Id = query.Id
-		return response, nil
-	case <-ctx.Done():
-		return nil, E.Cause(ctx.Err(), "wait UDP response")
-	case <-s.done:
-		return nil, s.err
+	var retryC <-chan time.Time
+	if d := udpRetransmitDelay(ctx); d > 0 {
+		timer := time.NewTimer(d)
+		defer timer.Stop()
+		retryC = timer.C
+	}
+
+	for {
+		select {
+		case response := <-pending.response:
+			response.Id = query.Id
+			return response, nil
+		case <-retryC:
+			retryC = nil // 只重传一次;nil channel 在 select 中永远阻塞
+			s.logger.Debug("no UDP response, retransmitting, id=", id)
+			if _, werr := s.conn.Write(packet); werr != nil {
+				// 重传失败不终止查询:原请求的应答仍可能到达,由 ctx 超时兜底
+				s.logger.Debug("UDP retransmit failed: ", werr)
+			}
+		case <-ctx.Done():
+			return nil, E.Cause(ctx.Err(), "wait UDP response")
+		case <-s.done:
+			return nil, s.err
+		}
 	}
 }
 
@@ -435,6 +493,13 @@ func (s *udpSession) armIdleLocked() {
 	s.idleTimer.Reset(s.idleTimeout)
 }
 
+// rearmIdle 供外部(SetKeepIdleConnections(false))在需要时重新武装空闲计时器。
+func (s *udpSession) rearmIdle() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.armIdleLocked()
+}
+
 func (s *udpSession) stopIdleLocked() {
 	if s.idleTimer != nil {
 		s.idleTimer.Stop()
@@ -465,6 +530,7 @@ func (s *udpSession) close(err error) {
 }
 
 // shutdownLocked 关闭会话并唤醒所有等待者。调用方需持有 s.mu。
+// 关闭原因被包装为 udpSessionClosedError,便于调用方识别并重试。
 func (s *udpSession) shutdownLocked(err error) {
 	if s.closed {
 		return
@@ -473,7 +539,7 @@ func (s *udpSession) shutdownLocked(err error) {
 		err = E.New("UDP session closed")
 	}
 	s.closed = true
-	s.err = err
+	s.err = &udpSessionClosedError{cause: err}
 	s.pending = nil
 	s.stopIdleLocked()
 	close(s.done)
@@ -493,7 +559,22 @@ func (s *udpSession) isClosed() bool {
 // 报文辅助函数
 // ---------------------------------------------------------------------------
 
-// udpPrepareQuery 返回查询的浅拷贝:启用压缩,并将 EDNS0 UDP 尺寸限制在 [512, 4096]。
+// udpRetransmitDelay 计算重传前的等待时间;返回 0 表示不重传。
+// 取 udpRetransmitInterval 与 ctx 剩余时间一半中的较小者,低于 udpMinRetransmit 则放弃。
+func udpRetransmitDelay(ctx context.Context) time.Duration {
+	d := udpRetransmitInterval
+	if dl, ok := ctx.Deadline(); ok {
+		if half := time.Until(dl) / 2; half < d {
+			d = half
+		}
+	}
+	if d < udpMinRetransmit {
+		return 0
+	}
+	return d
+}
+
+// udpPrepareQuery 返回查询的浅拷贝:启用压缩,并将 EDNS0 UDP 尺寸限制在 [512, 1232]。
 // 不修改调用方的 message。
 func udpPrepareQuery(message *mDNS.Msg) *mDNS.Msg {
 	query := *message
