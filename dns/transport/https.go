@@ -56,9 +56,6 @@ const (
 
 	// 优雅重置时，旧 transport 上在途请求的最长等待时间
 	drainGrace = 10 * time.Second
-
-	// 预热请求（含拨号、TLS 握手、h2 协商）的总超时
-	warmupTimeout = 5 * time.Second
 )
 
 var ErrTooManyRequests = errors.New("dns over https: too many concurrent async queries")
@@ -89,11 +86,6 @@ type HTTPSTransport struct {
 
 	consecutiveTimeouts atomic.Int32
 	asyncSlots          chan struct{}
-
-	// 预热相关
-	warming       atomic.Bool // 防止并发重复预热
-	warmupCtx     context.Context
-	warmupCancel  context.CancelFunc // 关闭时调用，取消在途预热并禁止后续预热
 }
 
 func NewHTTPS(ctx context.Context, contextLogger log.ContextLogger, tag string, options option.RemoteHTTPSDNSServerOptions) (adapter.DNSTransport, error) {
@@ -173,7 +165,6 @@ func NewHTTPSRaw(
 		// plain HTTP DoH used by Tailscale
 		fallback.Store(true)
 	}
-	warmupCtx, warmupCancel := context.WithCancel(context.Background())
 	transport := &HTTPSTransport{
 		TransportAdapter: transportAdapter,
 		logger:           contextLogger,
@@ -185,8 +176,6 @@ func NewHTTPSRaw(
 		fallback:         fallback,
 		transport:        NewHTTPSTransportWrapper(baseDialer, serverAddr, fallback),
 		asyncSlots:       make(chan struct{}, maxAsyncInFlight),
-		warmupCtx:        warmupCtx,
-		warmupCancel:     warmupCancel,
 	}
 	transport.keepIdle.Store(true)
 	return transport
@@ -196,70 +185,21 @@ func (t *HTTPSTransport) Start(stage adapter.StartStage, scope *adapter.Scope) e
 	switch stage {
 	case adapter.StartStateStart:
 		scope.Add(func() error {
-			// 关闭：先禁止并取消预热，再丢弃连接（不预热）
-			t.warmupCancel()
+			// 关闭：丢弃所有连接
 			t.resetTransport()
 			return nil
 		})
 		return dialer.InitializeDetour(t.dialer)
-	case adapter.StartStatePostStart:
-		// 此时 detour 出站已可用，异步预热不阻塞启动流程
-		t.Warmup()
 	}
 	return nil
 }
 
-// Warmup 异步预热：发送一个最小的 DNS 查询（. IN NS），
-// 使 TCP/TLS/h2 协商一次完成，连接进入连接池供后续真实查询复用。
-// 失败只记 debug 日志，不影响正常查询。
-func (t *HTTPSTransport) Warmup() {
-	if t.warmupCtx.Err() != nil {
-		return // 已关闭
-	}
-	if !t.keepIdle.Load() {
-		return // 不保留空闲连接时预热没有意义
-	}
-	if !t.warming.CompareAndSwap(false, true) {
-		return // 已有预热在进行
-	}
-	go func() {
-		defer t.warming.Store(false)
-
-		ctx, cancel := context.WithTimeout(t.warmupCtx, warmupTimeout)
-		defer cancel()
-
-		query := new(mDNS.Msg)
-		query.SetQuestion(".", mDNS.TypeNS)
-		query.Id = 0 // RFC 8484
-		query.Compress = true
-		payload, err := query.Pack()
-		if err != nil {
-			return
-		}
-
-		startAt := time.Now()
-		response, err := t.roundTrip(ctx, payload, new(requestTrace))
-		if err != nil {
-			if t.warmupCtx.Err() == nil {
-				t.logger.Debug("dns over https: warmup failed: ", err)
-			}
-			return
-		}
-		// 不关心状态码：只要连接建好即可复用。
-		// 必须排空并关闭 Body，连接才会归还，wrapper 的 inflight 计数才会减少。
-		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, maxDrainSize))
-		_ = response.Body.Close()
-		t.logger.Debug("dns over https: warmup done in ", time.Since(startAt))
-	}()
-}
-
-// Reset 由外部触发（网络变化等）：硬重置，旧连接作废，随后重建并预热。
+// Reset 由外部触发（网络变化等）：硬重置，旧连接作废，后续查询会自然重新建连。
 func (t *HTTPSTransport) Reset() {
 	t.resetTransport()
-	t.Warmup()
 }
 
-// resetTransport 硬重置：立即丢弃并关闭所有连接（包括在途请求），不预热。
+// resetTransport 硬重置：立即丢弃并关闭所有连接（包括在途请求）。
 // 用于关闭场景，也是 Reset 的基础。
 func (t *HTTPSTransport) resetTransport() {
 	t.transportAccess.Lock()
@@ -337,8 +277,6 @@ func (t *HTTPSTransport) ExchangeAsync(ctx context.Context, message *mDNS.Msg, c
 //     重置没有意义，仅在连续超时达到阈值后才重置。
 //  4. 重置有冷却时间，并发请求同时超时只会重置一次。
 //  5. 重置是"优雅"的：旧 transport 停止接收空闲连接，等在途请求结束或宽限期后才强制关闭。
-//  6. 超时自愈后不预热：此时服务端很可能慢或不可达，预热只会多一个必超时的请求，
-//     下一个真实查询会自然建连。
 func (t *HTTPSTransport) handleExchangeError(ctx context.Context, startAt time.Time, trace *requestTrace, err error) {
 	if !isTimeout(err) {
 		return
@@ -348,6 +286,7 @@ func (t *HTTPSTransport) handleExchangeError(ctx context.Context, startAt time.T
 	if !reusedConn && count < timeoutResetThreshold {
 		return
 	}
+
 	t.transportAccess.Lock()
 	if t.transportResetAt.After(startAt) || time.Since(t.transportResetAt) < resetCooldown {
 		t.transportAccess.Unlock()
@@ -355,6 +294,7 @@ func (t *HTTPSTransport) handleExchangeError(ctx context.Context, startAt time.T
 	}
 	oldTransport := t.swapTransportLocked()
 	t.transportAccess.Unlock()
+
 	t.consecutiveTimeouts.Store(0)
 	t.logger.DebugContext(ctx, "dns over https: transport reset after timeout (reused connection: ", reusedConn, ", consecutive timeouts: ", count, ")")
 	oldTransport.Shutdown(drainGrace)
@@ -418,6 +358,7 @@ func (t *HTTPSTransport) roundTrip(ctx context.Context, payload []byte, trace *r
 		request.Header = t.headers.Clone()
 		request.Header.Set("Content-Type", MimeType)
 		request.Header.Set("Accept", MimeType)
+
 		response, err := t.currentTransport().RoundTrip(request)
 		// 请求刚好撞上 transport 被替换并关闭：请求尚未发出，重新取新的 transport 重试一次
 		if err != nil && attempt == 0 && errors.Is(err, errTransportClosed) {
@@ -431,6 +372,7 @@ func (t *HTTPSTransport) readResponse(ctx context.Context, response *http.Respon
 	if response.ContentLength > maxDNSMessageSize {
 		return nil, E.New("response too large: ", response.ContentLength)
 	}
+
 	var (
 		responseMessage mDNS.Msg
 		unpackErr       error
