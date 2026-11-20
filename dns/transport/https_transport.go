@@ -26,7 +26,7 @@ const (
 
 	// 没有任何在途请求后，空闲连接最多保留的时间（保持连接常驻，减少冷启动）。
 	// 同时用作 HTTP/1.1 transport 的 IdleConnTimeout 和 wrapper 级别的空闲清理定时。
-	wrapperIdleTimeout = 3 * time.Minute
+	wrapperIdleTimeout = 60 * time.Second
 
 	// h2 健康检查：读空闲超过该时间发 PING，PingTimeout 内无响应则关闭连接
 	h2ReadIdleTimeout = 30 * time.Second
