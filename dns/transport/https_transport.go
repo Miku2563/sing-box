@@ -23,8 +23,11 @@ import (
 const (
 	// 单次拨号（含 TLS 握手）的上限；上层 ctx 更短时以 ctx 为准
 	wrapperDialTimeout = 15 * time.Second
-	// 没有任何在途请求后，空闲连接最多保留的时间
-	wrapperIdleTimeout = 60 * time.Second
+
+	// 没有任何在途请求后，空闲连接最多保留的时间（保持连接常驻，减少冷启动）。
+	// 同时用作 HTTP/1.1 transport 的 IdleConnTimeout 和 wrapper 级别的空闲清理定时。
+	wrapperIdleTimeout = 3 * time.Minute
+
 	// h2 健康检查：读空闲超过该时间发 PING，PingTimeout 内无响应则关闭连接
 	h2ReadIdleTimeout = 30 * time.Second
 	h2PingTimeout     = 10 * time.Second
@@ -36,6 +39,7 @@ const (
 var (
 	errFallback = E.New("fallback to HTTP/1.1")
 	errUseHTTP2 = errors.New("switch back to HTTP/2")
+
 	// errTransportClosed 表示请求落在了已被关闭的 wrapper 上。
 	// DNS 查询幂等，调用方可以换新的 wrapper 安全重试。
 	errTransportClosed = fmt.Errorf("dns over https: transport closed: %w", net.ErrClosed)
